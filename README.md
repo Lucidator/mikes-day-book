@@ -1,6 +1,6 @@
 # Mike's Day Book
 
-Personal daily task and scheduling system: daily task tracking, end-of-day reviews (completed vs rescheduled vs dropped), 2-hour pending-task reminders, priority flags, categories, a 7-day completion chart, and streaks.
+Personal daily task and scheduling system: daily task tracking, end-of-day reviews (completed vs rescheduled vs dropped), 2-hour pending-task reminders, priority flags, categories, recurring tasks (e.g. Mon–Fri), a sidebar with week-at-a-glance, a copyable end-of-day report, a 7-day completion chart, and streaks.
 
 Built with React + Vite, packaged as an installable PWA (Progressive Web App). Tasks are saved in the device's local storage — private, no account or database needed.
 
