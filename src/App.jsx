@@ -20,6 +20,15 @@ const shortDay = (ds) => {
   const [y, m, d] = ds.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString("en-GB", { weekday: "short" });
 };
+const dayOfWeek = (ds) => {
+  const [y, m, d] = ds.split("-").map(Number);
+  return new Date(y, m - 1, d).getDay(); // 0=Sun … 6=Sat
+};
+// Monday-first ordering for day pickers
+const WEEK = [
+  { v: 1, l: "Mon" }, { v: 2, l: "Tue" }, { v: 3, l: "Wed" }, { v: 4, l: "Thu" },
+  { v: 5, l: "Fri" }, { v: 6, l: "Sat" }, { v: 0, l: "Sun" },
+];
 
 const CATEGORIES = ["Compliance", "Projects", "Admin", "Meetings", "Personal"];
 const CAT_COLORS = {
@@ -65,6 +74,16 @@ export default function DailyTaskSystem() {
   const [showReminder, setShowReminder] = useState(false);
   const notifiedRef = useRef(0);
   const REMIND_MS = 2 * 60 * 60 * 1000; // 2 hours
+  // sidebar + recurring tasks
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showRecurring, setShowRecurring] = useState(false);
+  const [rTitle, setRTitle] = useState("");
+  const [rTime, setRTime] = useState("");
+  const [rCategory, setRCategory] = useState("Compliance");
+  const [rHigh, setRHigh] = useState(false);
+  const [rDays, setRDays] = useState([1, 2, 3, 4, 5]); // default Mon–Fri
+  const [showReport, setShowReport] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   // ---------- load ----------
   useEffect(() => {
@@ -74,12 +93,44 @@ export default function DailyTaskSystem() {
         const parsed = res ? JSON.parse(res.value) : { days: {} };
         const safe = parsed && parsed.days ? parsed : { days: {} };
         if (!safe.settings) safe.settings = { reminders: true, lastReminderAt: Date.now() };
+        if (!safe.recurring) safe.recurring = [];
         setData(safe);
       } catch {
-        setData({ days: {}, settings: { reminders: true, lastReminderAt: Date.now() } });
+        setData({ days: {}, recurring: [], settings: { reminders: true, lastReminderAt: Date.now() } });
       }
     })();
   }, []);
+
+  // materialize recurring tasks into today + the viewed day (never past days, never closed days)
+  useEffect(() => {
+    if (!data || !(data.recurring || []).length) return;
+    const targets = [...new Set([todayStr(), viewDate])].filter((ds) => ds >= todayStr());
+    let changed = false;
+    const nextDays = { ...data.days };
+    for (const ds of targets) {
+      const d = nextDays[ds] || emptyDay();
+      if (d.closed) continue;
+      const added = d.recAdded || [];
+      const dow = dayOfWeek(ds);
+      const toAdd = data.recurring.filter(
+        (r) => r.active !== false && (r.days || []).includes(dow) && !added.includes(r.id)
+      );
+      if (!toAdd.length) continue;
+      nextDays[ds] = {
+        ...d,
+        tasks: [
+          ...d.tasks,
+          ...toAdd.map((r) => ({
+            id: uid(), title: r.title, time: r.time || "", category: r.category,
+            high: !!r.high, done: false, doneAt: null, moves: 0, recId: r.id,
+          })),
+        ],
+        recAdded: [...added, ...toAdd.map((r) => r.id)],
+      };
+      changed = true;
+    }
+    if (changed) persist({ ...data, days: nextDays });
+  }, [data, viewDate]);
 
   // clock tick (every 30s) so reminders can fire
   useEffect(() => {
@@ -171,6 +222,104 @@ export default function DailyTaskSystem() {
     persist({ ...data, settings: { ...(data.settings || {}), reminders: !remindersOn, lastReminderAt: Date.now() } });
   };
 
+  // ---------- recurring tasks ----------
+  const addRecurring = () => {
+    const t = rTitle.trim();
+    if (!t || rDays.length === 0) return;
+    persist({
+      ...data,
+      recurring: [...(data.recurring || []), { id: uid(), title: t, time: rTime, category: rCategory, high: rHigh, days: [...rDays].sort(), active: true }],
+    });
+    setRTitle(""); setRTime(""); setRHigh(false); setRDays([1, 2, 3, 4, 5]);
+  };
+
+  const toggleRecurringActive = (id) => {
+    persist({ ...data, recurring: data.recurring.map((r) => (r.id === id ? { ...r, active: r.active === false } : r)) });
+  };
+
+  const deleteRecurring = (id) => {
+    persist({ ...data, recurring: data.recurring.filter((r) => r.id !== id) });
+  };
+
+  const daysLabel = (days) => {
+    const s = [...days].sort().join(",");
+    if (s === "1,2,3,4,5") return "Mon–Fri";
+    if (s === "0,1,2,3,4,5,6") return "Every day";
+    if (s === "0,6") return "Weekends";
+    return WEEK.filter((w) => days.includes(w.v)).map((w) => w.l).join(", ");
+  };
+
+  // ---------- end-of-day report (for the viewed day) ----------
+  const buildReport = () => {
+    const completed = tasks.filter((t) => t.done);
+    const resched = day.summary ? day.summary.rescheduled : [];
+    const dropped = day.summary ? day.summary.dropped : [];
+    const stillPending = day.closed ? [] : tasks.filter((t) => !t.done);
+    const total = completed.length + resched.length + dropped.length + stillPending.length;
+    const pct = total ? Math.round((completed.length / total) * 100) : 0;
+    const byCat = {};
+    completed.forEach((t) => { byCat[t.category] = (byCat[t.category] || 0) + 1; });
+    return { completed, resched, dropped, stillPending, total, pct, byCat };
+  };
+
+  const reportText = () => {
+    const r = buildReport();
+    const lines = [];
+    lines.push("MIKE'S DAY BOOK — DAILY REPORT");
+    lines.push(prettyDate(viewDate) + (day.closed ? " (day closed)" : " (in progress)"));
+    lines.push("");
+    lines.push(`Score: ${r.completed.length}/${r.total} completed (${r.pct}%)`);
+    if (r.completed.length) {
+      lines.push("");
+      lines.push("COMPLETED:");
+      r.completed.forEach((t) => lines.push(`  ✓ ${t.title}${t.doneAt ? ` (${t.doneAt})` : ""}`));
+    }
+    if (r.resched.length) {
+      lines.push("");
+      lines.push("RESCHEDULED TO NEXT DAY:");
+      r.resched.forEach((t) => lines.push(`  → ${t}`));
+    }
+    if (r.dropped.length) {
+      lines.push("");
+      lines.push("DROPPED:");
+      r.dropped.forEach((t) => lines.push(`  ✕ ${t}`));
+    }
+    if (r.stillPending.length) {
+      lines.push("");
+      lines.push("STILL PENDING:");
+      r.stillPending.forEach((t) => lines.push(`  • ${t.title}`));
+    }
+    const cats = Object.entries(r.byCat);
+    if (cats.length) {
+      lines.push("");
+      lines.push("BY CATEGORY: " + cats.map(([c, n]) => `${c} ${n}`).join(" · "));
+    }
+    if (day.note && day.note.trim()) {
+      lines.push("");
+      lines.push("NOTES: " + day.note.trim());
+    }
+    return lines.join("\n");
+  };
+
+  const copyReport = async () => {
+    const text = reportText();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setCopied(true);
+      } catch {}
+    }
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   // ---------- actions ----------
   const addTask = () => {
     const t = title.trim();
@@ -250,6 +399,7 @@ export default function DailyTaskSystem() {
     }
     persist(next);
     setShowReview(false);
+    setShowReport(true); // show the end-of-day report right after closing
   };
 
   const reopenDay = () => updateDay(viewDate, (d) => ({ ...d, closed: false, summary: d.summary }));
@@ -304,7 +454,9 @@ export default function DailyTaskSystem() {
 
       {/* header */}
       <header style={S.header}>
-        <div>
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+          <button style={S.hamburger} onClick={() => setSidebarOpen(true)} aria-label="Open menu">☰</button>
+          <div>
           <div style={S.eyebrow}>MIKE'S DAY BOOK</div>
           <h1 style={S.h1}>{prettyDate(viewDate)}</h1>
           <div style={S.sub}>
@@ -318,6 +470,7 @@ export default function DailyTaskSystem() {
             ⏰ 2-hour reminders: {remindersOn ? "On" : "Off"}
             {remindersOn && pendingToday.length > 0 && ` · next in ${nextIn}`}
           </button>
+          </div>
         </div>
         <div style={S.nav}>
           <button style={S.navBtn} onClick={() => setViewDate(addDays(viewDate, -1))} aria-label="Previous day">‹</button>
@@ -325,6 +478,106 @@ export default function DailyTaskSystem() {
           <button style={S.navBtn} onClick={() => setViewDate(addDays(viewDate, 1))} aria-label="Next day">›</button>
         </div>
       </header>
+
+      {/* sidebar drawer */}
+      {sidebarOpen && (
+        <div style={S.overlay} onClick={() => setSidebarOpen(false)}>
+          <aside style={S.sidebar} onClick={(e) => e.stopPropagation()} aria-label="Menu">
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
+              <div style={S.brandIcon}>✓</div>
+              <div>
+                <div style={{ ...S.eyebrow, fontSize: 12 }}>MIKE'S</div>
+                <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 18, lineHeight: 1 }}>Day Book</div>
+              </div>
+            </div>
+
+            <button style={S.sideItem} onClick={() => { setViewDate(todayStr()); setSidebarOpen(false); }}>
+              📅 Today
+              {pendingToday.length > 0 && <span style={S.sideBadge}>{pendingToday.length}</span>}
+            </button>
+            <button style={S.sideItem} onClick={() => { setShowRecurring(true); setSidebarOpen(false); }}>
+              ↻ Recurring tasks
+              {(data.recurring || []).filter((r) => r.active !== false).length > 0 && (
+                <span style={S.sideBadge}>{data.recurring.filter((r) => r.active !== false).length}</span>
+              )}
+            </button>
+            <button style={S.sideItem} onClick={() => { setShowReport(true); setSidebarOpen(false); }}>
+              📋 Day report
+            </button>
+            <button style={S.sideItem} onClick={toggleReminders}>
+              ⏰ Reminders <span style={{ marginLeft: "auto", fontSize: 12, fontWeight: 700, color: remindersOn ? "#0B6E4F" : "#8A97A3" }}>{remindersOn ? "ON" : "OFF"}</span>
+            </button>
+
+            <div style={S.sideDivider} />
+            <div style={{ ...S.eyebrow, fontSize: 10, marginBottom: 6 }}>THIS WEEK</div>
+            {last7.slice().reverse().map((d) => (
+              <button key={d.ds} style={{ ...S.sideItem, padding: "7px 10px", fontSize: 13, background: d.ds === viewDate ? "#0B6E4F12" : "transparent" }}
+                onClick={() => { setViewDate(d.ds); setSidebarOpen(false); }}>
+                {d.ds === todayStr() ? "Today" : `${shortDay(d.ds)} ${d.ds.slice(8)}`}
+                <span style={{ marginLeft: "auto", fontSize: 12, color: "#6B7A88" }}>{d.total ? `${d.done}/${d.total}` : "—"}</span>
+              </button>
+            ))}
+
+            <div style={S.sideDivider} />
+            <div style={{ fontSize: 11.5, color: "#8A97A3", lineHeight: 1.5 }}>Your tasks stay on this device.</div>
+          </aside>
+        </div>
+      )}
+
+      {/* recurring tasks manager */}
+      {showRecurring && (
+        <div style={S.overlay} onClick={() => setShowRecurring(false)}>
+          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={S.eyebrow}>RECURRING TASKS</div>
+            <h2 style={{ ...S.h1, fontSize: 20, margin: "4px 0 4px" }}>Repeat on chosen days</h2>
+            <p style={{ fontSize: 13, color: "#6B7A88", margin: "0 0 12px" }}>These are added to your list automatically on the days you pick.</p>
+
+            <input style={S.input} placeholder="e.g. Review transaction monitoring alerts" value={rTitle}
+              onChange={(e) => setRTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addRecurring()} />
+            <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+              {WEEK.map((w) => (
+                <button key={w.v}
+                  style={{ ...S.dayChip, background: rDays.includes(w.v) ? "#0B6E4F" : "#fff", color: rDays.includes(w.v) ? "#fff" : "#16232E", borderColor: rDays.includes(w.v) ? "#0B6E4F" : "#D5DDE4" }}
+                  onClick={() => setRDays(rDays.includes(w.v) ? rDays.filter((x) => x !== w.v) : [...rDays, w.v])}
+                  aria-pressed={rDays.includes(w.v)}>
+                  {w.l}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+              <button style={{ ...S.chipBtn, fontSize: 12, borderColor: "#D5DDE4", color: "#16232E" }} onClick={() => setRDays([1, 2, 3, 4, 5])}>Mon–Fri</button>
+              <button style={{ ...S.chipBtn, fontSize: 12, borderColor: "#D5DDE4", color: "#16232E" }} onClick={() => setRDays([0, 1, 2, 3, 4, 5, 6])}>Every day</button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+              <input type="time" style={{ ...S.input, width: 110, flex: "none" }} value={rTime} onChange={(e) => setRTime(e.target.value)} aria-label="Time (optional)" />
+              <select style={{ ...S.input, width: 130, flex: "none" }} value={rCategory} onChange={(e) => setRCategory(e.target.value)}>
+                {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
+              </select>
+              <button style={{ ...S.chipBtn, background: rHigh ? "#B3402E" : "#fff", color: rHigh ? "#fff" : "#B3402E", borderColor: "#B3402E" }} onClick={() => setRHigh(!rHigh)}>★</button>
+              <button style={S.primaryBtn} onClick={addRecurring}>Add</button>
+            </div>
+
+            <div style={{ ...S.reviewSection, marginTop: 16 }}>
+              <div style={S.reviewLabel}>Your recurring tasks ({(data.recurring || []).length})</div>
+              {(data.recurring || []).length === 0 && <div style={S.reviewEmptyLine}>None yet — add your first above.</div>}
+              {(data.recurring || []).map((r) => (
+                <div key={r.id} style={{ ...S.reviewLine, display: "flex", alignItems: "center", gap: 8, opacity: r.active === false ? 0.5 : 1 }}>
+                  <span style={{ flex: 1, minWidth: 120 }}>
+                    {r.high && <span style={S.star}>★ </span>}{r.title}
+                    <span style={{ display: "block", fontSize: 12, color: "#6B7A88" }}>{daysLabel(r.days || [])}{r.time ? ` · ${r.time}` : ""} · {r.category}</span>
+                  </span>
+                  <button style={{ ...S.chipBtn, fontSize: 12, borderColor: "#D5DDE4", color: "#16232E" }} onClick={() => toggleRecurringActive(r.id)}>
+                    {r.active === false ? "Resume" : "Pause"}
+                  </button>
+                  <button style={{ ...S.iconBtn, color: "#B3402E" }} onClick={() => deleteRecurring(r.id)} aria-label="Delete recurring task">✕</button>
+                </div>
+              ))}
+            </div>
+
+            <button style={{ ...S.ghostBtn, width: "100%", marginTop: 14 }} onClick={() => setShowRecurring(false)}>Done</button>
+          </div>
+        </div>
+      )}
 
       {/* 2-hour reminder banner */}
       {showReminder && remindersOn && pendingToday.length > 0 && (
@@ -358,9 +611,89 @@ export default function DailyTaskSystem() {
         <div style={S.closedCard}>
           <div style={S.stamp}>DAY CLOSED · {day.summary.closedAt}</div>
           <SummaryBlock summary={day.summary} />
-          <button style={S.ghostBtn} onClick={reopenDay}>Reopen this day</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={S.ghostBtn} onClick={() => setShowReport(true)}>📋 View full report</button>
+            <button style={S.ghostBtn} onClick={reopenDay}>Reopen this day</button>
+          </div>
         </div>
       )}
+
+      {/* end-of-day report modal */}
+      {showReport && (() => {
+        const r = buildReport();
+        return (
+          <div style={S.overlay} onClick={() => setShowReport(false)}>
+            <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+              <div style={S.eyebrow}>END-OF-DAY REPORT</div>
+              <h2 style={{ ...S.h1, fontSize: 21, margin: "4px 0 2px" }}>{prettyDate(viewDate)}</h2>
+              <div style={{ fontSize: 12.5, color: "#6B7A88", marginBottom: 12 }}>{day.closed ? `Day closed${day.summary?.closedAt ? " at " + day.summary.closedAt : ""}` : "Day still in progress"}</div>
+
+              {/* score ring */}
+              <div style={{ display: "flex", alignItems: "center", gap: 14, background: "#F3F8F5", borderRadius: 12, padding: "12px 14px" }}>
+                <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 34, color: "#0B6E4F", lineHeight: 1 }}>{r.pct}%</div>
+                <div style={{ fontSize: 13.5, color: "#16232E" }}>
+                  <strong>{r.completed.length}</strong> of <strong>{r.total}</strong> tasks completed
+                  {r.resched.length > 0 && <span style={{ color: "#C77D1F" }}> · {r.resched.length} rescheduled</span>}
+                  {r.dropped.length > 0 && <span style={{ color: "#B3402E" }}> · {r.dropped.length} dropped</span>}
+                  {r.stillPending.length > 0 && <span> · {r.stillPending.length} pending</span>}
+                </div>
+              </div>
+
+              <div style={S.reviewSection}>
+                <div style={S.reviewLabel}>✓ Completed ({r.completed.length})</div>
+                {r.completed.length === 0 && <div style={S.reviewEmptyLine}>Nothing completed{day.closed ? "" : " yet"}.</div>}
+                {r.completed.map((t) => (
+                  <div key={t.id} style={S.reviewLine}>{t.title}{t.doneAt && <span style={{ color: "#8A97A3" }}> · {t.doneAt}</span>}</div>
+                ))}
+              </div>
+
+              {r.resched.length > 0 && (
+                <div style={S.reviewSection}>
+                  <div style={{ ...S.reviewLabel, color: "#C77D1F" }}>→ Rescheduled to next day ({r.resched.length})</div>
+                  {r.resched.map((t, i) => <div key={i} style={S.reviewLine}>{t}</div>)}
+                </div>
+              )}
+
+              {r.dropped.length > 0 && (
+                <div style={S.reviewSection}>
+                  <div style={{ ...S.reviewLabel, color: "#B3402E" }}>✕ Dropped ({r.dropped.length})</div>
+                  {r.dropped.map((t, i) => <div key={i} style={S.reviewLine}>{t}</div>)}
+                </div>
+              )}
+
+              {r.stillPending.length > 0 && (
+                <div style={S.reviewSection}>
+                  <div style={{ ...S.reviewLabel, color: "#6B7A88" }}>• Still pending ({r.stillPending.length})</div>
+                  {r.stillPending.map((t) => <div key={t.id} style={S.reviewLine}>{t.title}</div>)}
+                </div>
+              )}
+
+              {Object.keys(r.byCat).length > 0 && (
+                <div style={S.reviewSection}>
+                  <div style={S.reviewLabel}>By category</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
+                    {Object.entries(r.byCat).map(([c, n]) => (
+                      <span key={c} style={{ ...S.catPill, background: (CAT_COLORS[c] || "#6B7A88") + "18", color: CAT_COLORS[c] || "#6B7A88" }}>{c} · {n}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {day.note && day.note.trim() && (
+                <div style={S.reviewSection}>
+                  <div style={S.reviewLabel}>Notes</div>
+                  <div style={{ ...S.reviewLine, whiteSpace: "pre-wrap" }}>{day.note.trim()}</div>
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+                <button style={{ ...S.primaryBtn, flex: 1 }} onClick={copyReport}>{copied ? "Copied ✓" : "Copy report"}</button>
+                <button style={{ ...S.ghostBtn, marginTop: 0 }} onClick={() => setShowReport(false)}>Close</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* add task */}
       {!day.closed && (
@@ -406,6 +739,7 @@ export default function DailyTaskSystem() {
               <div style={S.taskMeta}>
                 {t.time && <span style={S.timePill}>{t.time}</span>}
                 <span style={{ ...S.catPill, background: (CAT_COLORS[t.category] || "#6B7A88") + "18", color: CAT_COLORS[t.category] || "#6B7A88" }}>{t.category}</span>
+                {t.recId && <span style={{ ...S.movedPill, color: "#0B6E4F", background: "#0B6E4F14" }}>↻ recurring</span>}
                 {t.moves > 0 && <span style={S.movedPill}>moved {t.moves}×</span>}
                 {t.done && t.doneAt && <span style={{ color: "#8A97A3", fontSize: 12 }}>done {t.doneAt}</span>}
               </div>
@@ -607,4 +941,28 @@ const S = {
     marginTop: 8, padding: "5px 10px", borderRadius: 20, border: "1.5px solid",
     background: "#fff", fontSize: 12, fontWeight: 600,
   },
+  hamburger: {
+    width: 38, height: 38, borderRadius: 9, border: "1px solid #D5DDE4", background: "#fff",
+    fontSize: 17, color: "#16232E", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+  },
+  sidebar: {
+    position: "fixed", left: 0, top: 0, bottom: 0, width: 274, maxWidth: "82vw",
+    background: "#fff", padding: "18px 14px", overflowY: "auto",
+    boxShadow: "4px 0 24px rgba(22,35,46,0.18)", display: "flex", flexDirection: "column",
+  },
+  brandIcon: {
+    width: 36, height: 36, borderRadius: 10, background: "#0B6E4F", color: "#fff",
+    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800,
+  },
+  sideItem: {
+    display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left",
+    padding: "10px 10px", borderRadius: 9, border: "none", background: "transparent",
+    fontSize: 14, fontWeight: 500, color: "#16232E", marginBottom: 2,
+  },
+  sideBadge: {
+    marginLeft: "auto", background: "#0B6E4F", color: "#fff", borderRadius: 12,
+    fontSize: 11.5, fontWeight: 700, padding: "1px 8px",
+  },
+  sideDivider: { height: 1, background: "#EEF1F5", margin: "12px 0" },
+  dayChip: { padding: "7px 11px", borderRadius: 8, border: "1.5px solid", fontSize: 12.5, fontWeight: 700 },
 };
